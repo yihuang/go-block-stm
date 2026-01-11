@@ -1,7 +1,7 @@
 package block_stm
 
 import (
-	"bytes"
+	"sync"
 
 	storetypes "cosmossdk.io/store/types"
 )
@@ -19,7 +19,7 @@ func NewMVData() *MVData {
 }
 
 type GMVData[V any] struct {
-	BTree[dataItem[V]]
+	data    sync.Map // map[string]*BTree[secondaryDataItem[V]] where string is Key
 	isZero   func(V) bool
 	valueLen func(V) int
 }
@@ -35,7 +35,6 @@ func NewMVStore(key storetypes.StoreKey) MVStore {
 
 func NewGMVData[V any](isZero func(V) bool, valueLen func(V) int) *GMVData[V] {
 	return &GMVData[V]{
-		BTree:    *NewBTree(KeyItemLess[dataItem[V]], OuterBTreeDegree),
 		isZero:   isZero,
 		valueLen: valueLen,
 	}
@@ -43,17 +42,17 @@ func NewGMVData[V any](isZero func(V) bool, valueLen func(V) int) *GMVData[V] {
 
 // getTree returns `nil` if not found
 func (d *GMVData[V]) getTree(key Key) *BTree[secondaryDataItem[V]] {
-	outer, _ := d.Get(dataItem[V]{Key: key})
-	return outer.Tree
+	val, ok := d.data.Load(string(key))
+	if !ok {
+		return nil
+	}
+	return val.(*BTree[secondaryDataItem[V]])
 }
 
 // getTreeOrDefault set a new tree atomically if not found.
 func (d *GMVData[V]) getTreeOrDefault(key Key) *BTree[secondaryDataItem[V]] {
-	return d.GetOrDefault(dataItem[V]{Key: key}, func(item *dataItem[V]) {
-		if item.Tree == nil {
-			item.Tree = NewBTree(secondaryLesser[V], InnerBTreeDegree)
-		}
-	}).Tree
+	val, _ := d.data.LoadOrStore(string(key), NewBTree(secondaryLesser[V], InnerBTreeDegree))
+	return val.(*BTree[secondaryDataItem[V]])
 }
 
 func (d *GMVData[V]) Write(key Key, value V, version TxnVersion) {
@@ -99,7 +98,9 @@ func (d *GMVData[V]) Iterator(
 	opts IteratorOptions, txn TxnIndex,
 	waitFn func(TxnIndex),
 ) *MVIterator[V] {
-	return NewMVIterator(opts, txn, d.Iter(), waitFn)
+	// TODO: Implement proper iterator for sync.Map
+	// For now, panic since iteration feature is temporarily broken as requested
+	panic("Iterator not implemented for GMVData with sync.Map - iteration feature temporarily broken")
 }
 
 // ValidateReadSet validates the read descriptors,
@@ -130,35 +131,9 @@ func (d *GMVData[V]) ValidateReadSet(txn TxnIndex, rs *ReadSet) bool {
 // validateIterator validates the iteration descriptor by replaying and compare the recorded reads.
 // returns true if valid.
 func (d *GMVData[V]) validateIterator(desc IteratorDescriptor, txn TxnIndex) bool {
-	it := NewMVIterator(desc.IteratorOptions, txn, d.Iter(), nil)
-	defer it.Close()
-
-	var i int
-	for ; it.Valid(); it.Next() {
-		if desc.Stop != nil {
-			if BytesBeyond(it.Key(), desc.Stop, desc.Ascending) {
-				break
-			}
-		}
-
-		if i >= len(desc.Reads) {
-			return false
-		}
-
-		read := desc.Reads[i]
-		if read.Version != it.Version() || !bytes.Equal(read.Key, it.Key()) {
-			return false
-		}
-
-		i++
-	}
-
-	// we read an estimate value, fail the validation.
-	if it.ReadEstimateValue() {
-		return false
-	}
-
-	return i == len(desc.Reads)
+	// TODO: Implement iterator validation for sync.Map
+	// For now, return false since iteration feature is temporarily broken
+	return false
 }
 
 func (d *GMVData[V]) Snapshot() (snapshot []GKVPair[V]) {
@@ -170,8 +145,9 @@ func (d *GMVData[V]) Snapshot() (snapshot []GKVPair[V]) {
 }
 
 func (d *GMVData[V]) SnapshotTo(cb func(Key, V) bool) {
-	d.Scan(func(outer dataItem[V]) bool {
-		item, ok := outer.Tree.Max()
+	d.data.Range(func(key, value interface{}) bool {
+		tree := value.(*BTree[secondaryDataItem[V]])
+		item, ok := tree.Max()
 		if !ok {
 			return true
 		}
@@ -180,7 +156,7 @@ func (d *GMVData[V]) SnapshotTo(cb func(Key, V) bool) {
 			return true
 		}
 
-		return cb(outer.Key, item.Value)
+		return cb([]byte(key.(string)), item.Value)
 	})
 }
 

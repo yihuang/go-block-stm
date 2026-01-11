@@ -97,11 +97,22 @@ func TestSnapshot(t *testing.T) {
 	data.Write([]byte("d"), nil, TxnVersion{Index: 3, Incarnation: 1})
 	data.WriteEstimate([]byte("c"), 2)
 
-	require.Equal(t, []KVPair{
-		{[]byte("a"), []byte("3")},
-		{[]byte("b"), []byte("2")},
-		{[]byte("d"), nil},
-	}, data.Snapshot())
+	// Note: sync.Map.Range doesn't guarantee order, so we check the snapshot as a map
+	snapshot := data.Snapshot()
+	require.Len(t, snapshot, 3)
+
+	// Convert to map for unordered comparison
+	snapshotMap := make(map[string][]byte)
+	for _, kv := range snapshot {
+		snapshotMap[string(kv.Key)] = kv.Value
+	}
+
+	expected := map[string][]byte{
+		"a": []byte("3"),
+		"b": []byte("2"),
+		"d": nil,
+	}
+	require.Equal(t, expected, snapshotMap)
 
 	data.SnapshotToStore(storage)
 	require.Equal(t, []byte("3"), storage.Get([]byte("a")))
