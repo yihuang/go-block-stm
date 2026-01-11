@@ -2,14 +2,12 @@ package block_stm
 
 import (
 	"sync"
-
-	"github.com/kelindar/bitmap"
 )
 
 // OptimizedSecondaryStore is an optimized version of secondary BTree using bitmap + sync.Map
 type OptimizedSecondaryStore[V any] struct {
 	mu      sync.RWMutex
-	bitmap  bitmap.Bitmap           // marks which TxnIndex have data
+	bitmap  Bitmap                  // marks which TxnIndex have data
 	data    sync.Map                // TxnIndex -> secondaryDataItem[V]
 	maxIdx  TxnIndex                // current maximum index for quick lookup
 	version TxnVersion              // current maximum version (index + incarnation)
@@ -18,7 +16,7 @@ type OptimizedSecondaryStore[V any] struct {
 // NewOptimizedSecondaryStore creates a new optimized secondary store
 func NewOptimizedSecondaryStore[V any]() *OptimizedSecondaryStore[V] {
 	return &OptimizedSecondaryStore[V]{
-		bitmap:  bitmap.Bitmap{},
+		bitmap:  Bitmap{},
 		maxIdx:  -1,
 		version: InvalidTxnVersion,
 	}
@@ -31,37 +29,33 @@ func (s *OptimizedSecondaryStore[V]) Read(txn TxnIndex) (V, TxnVersion, bool) {
 		return zero, InvalidTxnVersion, false
 	}
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	// Convert txn to uint32 for bitmap operations
+	target := uint32(txn)
+	if target == 0 {
+		var zero V
+		return zero, InvalidTxnVersion, false
+	}
+
+	// We need to find index < txn (exclusive)
+	// PreviousValue returns the greatest value that is less than target
+	// So we call PreviousValue(txn) to find index < txn
+	// No need to subtract 1
 
 	// Keep searching until we find valid data or exhaust all possibilities
-	// We need to find the closest index < txn that has valid data in sync.Map
-	// Use a set to track indices we've already checked
-	checked := make(map[TxnIndex]bool)
-	currentTxn := txn
-
 	for {
-		// Find the closest index < currentTxn that has data in bitmap
-		// and hasn't been checked yet
-		var foundIdx TxnIndex = -1
-		s.bitmap.Range(func(x uint32) {
-			idx := TxnIndex(x)
-			if idx < currentTxn && !checked[idx] {
-				if foundIdx < 0 || idx > foundIdx {
-					foundIdx = idx
-				}
-			}
-		})
+		// Find the closest index <= target that has data in bitmap
+		s.mu.RLock()
+		prev, found := s.bitmap.PreviousValue(target)
+		s.mu.RUnlock()
 
-		if foundIdx < 0 {
-			break
+		if !found {
+			var zero V
+			return zero, InvalidTxnVersion, false
 		}
 
-		// Mark this index as checked
-		checked[foundIdx] = true
-
 		// Try to get the data from sync.Map
-		if item, ok := s.data.Load(foundIdx); ok {
+		idx := TxnIndex(prev)
+		if item, ok := s.data.Load(idx); ok {
 			dataItem := item.(secondaryDataItem[V])
 			if dataItem.Estimate {
 				return dataItem.Value, dataItem.Version(), true
@@ -70,64 +64,25 @@ func (s *OptimizedSecondaryStore[V]) Read(txn TxnIndex) (V, TxnVersion, bool) {
 		}
 
 		// Data not found in sync.Map (concurrent modification or deletion)
-		// Continue searching, but don't update currentTxn since we want to
-		// check all indices < original txn
+		// Continue searching with the next possible index
+		if prev == 0 {
+			break
+		}
+		target = prev
 	}
 
 	var zero V
 	return zero, InvalidTxnVersion, false
 }
 
-// findClosestIndex finds the closest index <= txn that has data in bitmap
-func (s *OptimizedSecondaryStore[V]) findClosestIndex(txn TxnIndex) TxnIndex {
-	return s.findClosestIndexLessThan(txn)
-}
-
-// findClosestIndexLessThan finds the closest index < txn (exclusive) that has data in bitmap
-func (s *OptimizedSecondaryStore[V]) findClosestIndexLessThan(txn TxnIndex) TxnIndex {
-	// Convert txn to uint32 for bitmap operations
-	target := uint32(txn)
-	if target == 0 {
-		return -1
-	}
-	// Look for index < txn (exclusive)
-	target = target - 1
-
-	// We need to find the maximum set bit that is <= target
-	// Since bitmap doesn't have a Prev method, we'll use Range and track the result
-	var found uint32 = 0
-	hasFound := false
-
-	s.bitmap.Range(func(x uint32) {
-		if x <= target && x > found {
-			found = x
-			hasFound = true
-		}
-	})
-
-	if !hasFound {
-		return -1
-	}
-	return TxnIndex(found)
-}
 
 // Write writes a value with the given version
 func (s *OptimizedSecondaryStore[V]) Write(value V, version TxnVersion) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	idx := version.Index
-	// Set the bit in bitmap
-	s.bitmap.Set(uint32(idx))
 
-	// Store the data in sync.Map
-	item := secondaryDataItem[V]{
-		Index:       idx,
-		Incarnation: version.Incarnation,
-		Value:       value,
-		Estimate:    false,
-	}
-	s.data.Store(idx, item)
+	// Set the bit in bitmap (protected by mutex)
+	s.mu.Lock()
+	s.bitmap.Set(uint32(idx))
 
 	// Update max index and version if needed
 	if idx > s.maxIdx {
@@ -136,119 +91,126 @@ func (s *OptimizedSecondaryStore[V]) Write(value V, version TxnVersion) {
 	} else if idx == s.maxIdx && version.Incarnation > s.version.Incarnation {
 		s.version = version
 	}
+	s.mu.Unlock()
+
+	// Store the data in sync.Map (no mutex needed)
+	item := secondaryDataItem[V]{
+		Index:       idx,
+		Incarnation: version.Incarnation,
+		Value:       value,
+		Estimate:    false,
+	}
+	s.data.Store(idx, item)
 }
 
 // WriteEstimate writes an estimate for the given txn
 func (s *OptimizedSecondaryStore[V]) WriteEstimate(txn TxnIndex) {
+	// Set the bit in bitmap (protected by mutex)
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Set the bit in bitmap
 	s.bitmap.Set(uint32(txn))
-
-	// Store the estimate in sync.Map
-	item := secondaryDataItem[V]{
-		Index:    txn,
-		Estimate: true,
-	}
-	s.data.Store(txn, item)
 
 	// Update max index if needed (estimates don't affect version)
 	if txn > s.maxIdx {
 		s.maxIdx = txn
 		// For estimates, we don't update version as it's not a real value
 	}
+	s.mu.Unlock()
+
+	// Store the estimate in sync.Map (no mutex needed)
+	item := secondaryDataItem[V]{
+		Index:    txn,
+		Estimate: true,
+	}
+	s.data.Store(txn, item)
 }
 
 // Delete marks the key as deleted at the given txn
 func (s *OptimizedSecondaryStore[V]) Delete(txn TxnIndex) {
+	// First, remove any existing entry from sync.Map
+	s.data.Delete(txn)
+
+	// Then set the bit in bitmap and update state (protected by mutex)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Set the bit in bitmap
 	s.bitmap.Set(uint32(txn))
-
-	// For Delete, we need to remove any existing entry at this txn
-	// and ensure no value is stored (following BTree.Delete behavior)
-	s.data.Delete(txn)
 
 	// Update max index if needed
 	if txn > s.maxIdx {
 		s.maxIdx = txn
 		// For deletions at new max index, we need to find the previous version
-		// Search for the closest index < txn that has data
+		// We'll update version lazily when needed
 		s.version = InvalidTxnVersion
-		var prevIdx TxnIndex = -1
-		s.bitmap.Range(func(x uint32) {
-			idx := TxnIndex(x)
-			if idx < txn && idx > prevIdx {
-				prevIdx = idx
-			}
-		})
-		if prevIdx >= 0 {
-			if item, ok := s.data.Load(prevIdx); ok {
-				s.version = item.(secondaryDataItem[V]).Version()
-			}
-		}
 	} else if txn == s.maxIdx {
 		// If deleting at current max index, find the new max version
 		s.version = InvalidTxnVersion
-		var prevIdx TxnIndex = -1
-		s.bitmap.Range(func(x uint32) {
-			idx := TxnIndex(x)
-			if idx < txn && idx > prevIdx {
-				prevIdx = idx
-			}
-		})
-		if prevIdx >= 0 {
-			if item, ok := s.data.Load(prevIdx); ok {
-				s.version = item.(secondaryDataItem[V]).Version()
-			}
-		}
 	}
 }
 
 // Max returns the maximum item in the store
 func (s *OptimizedSecondaryStore[V]) Max() (secondaryDataItem[V], bool) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
+	maxIdx := s.maxIdx
+	s.mu.RUnlock()
 
-	if s.maxIdx < 0 {
+	if maxIdx < 0 {
 		return secondaryDataItem[V]{}, false
 	}
 
 	// Try to get data at maxIdx
-	if item, ok := s.data.Load(s.maxIdx); ok {
+	if item, ok := s.data.Load(maxIdx); ok {
 		return item.(secondaryDataItem[V]), true
 	}
 
 	// If no data at maxIdx (e.g., deletion), find the previous index with data
-	var maxItem secondaryDataItem[V]
-	found := false
-	s.bitmap.Range(func(x uint32) {
-		idx := TxnIndex(x)
-		if idx <= s.maxIdx && idx > maxItem.Index {
-			if item, ok := s.data.Load(idx); ok {
-				maxItem = item.(secondaryDataItem[V])
-				found = true
-			}
-		}
-	})
+	// We need to check bitmap for the actual maximum index with data
+	s.mu.RLock()
+	max, found := s.bitmap.Max()
+	s.mu.RUnlock()
 
-	return maxItem, found
+	if !found {
+		return secondaryDataItem[V]{}, false
+	}
+
+	// Try to get data at the actual maximum index in bitmap
+	maxIdx = TxnIndex(max)
+	if item, ok := s.data.Load(maxIdx); ok {
+		return item.(secondaryDataItem[V]), true
+	}
+
+	// If no data at the maximum bitmap index, we need to search backward
+	// This is similar to Read but we want the maximum item with data
+	var maxItem secondaryDataItem[V]
+	s.mu.RLock()
+	prev := max
+	for {
+		// Try to get data at current index
+		if item, ok := s.data.Load(TxnIndex(prev)); ok {
+			maxItem = item.(secondaryDataItem[V])
+			s.mu.RUnlock()
+			return maxItem, true
+		}
+
+		// Find previous index in bitmap
+		prev, found = s.bitmap.PreviousValue(prev)
+		if !found {
+			s.mu.RUnlock()
+			return secondaryDataItem[V]{}, false
+		}
+	}
 }
 
 // Scan iterates over all items in the store
 func (s *OptimizedSecondaryStore[V]) Scan(iter func(item secondaryDataItem[V]) bool) {
+	// Get all indices from bitmap (protected by mutex)
 	s.mu.RLock()
-	// Get all indices from bitmap
 	indices := make([]uint32, 0, s.bitmap.Count())
 	s.bitmap.Range(func(x uint32) {
 		indices = append(indices, x)
 	})
 	s.mu.RUnlock()
 
-	// Iterate through indices and load data
+	// Iterate through indices and load data (no mutex needed for sync.Map)
 	for _, idx := range indices {
 		if item, ok := s.data.Load(TxnIndex(idx)); ok {
 			if !iter(item.(secondaryDataItem[V])) {
@@ -261,6 +223,7 @@ func (s *OptimizedSecondaryStore[V]) Scan(iter func(item secondaryDataItem[V]) b
 // Size returns the number of items in the store
 func (s *OptimizedSecondaryStore[V]) Size() int {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.bitmap.Count()
+	size := s.bitmap.Count()
+	s.mu.RUnlock()
+	return size
 }

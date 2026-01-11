@@ -15,6 +15,11 @@ func (dst *Bitmap) Set(x uint32) {
 	if dst.offset == 0 && len(dst.bm) == 0 {
 		// initialize
 		dst.offset = x &^ 0x3F
+		// Ensure bm has at least one block
+		blkIdx := int((x - dst.offset) >> 6)
+		if blkIdx >= len(dst.bm) {
+			dst.bm = make(bitmap.Bitmap, blkIdx+1)
+		}
 	} else if x < dst.offset {
 		// grow blocks backward
 		blkGrow := int(dst.offset>>6 - x>>6)
@@ -22,6 +27,14 @@ func (dst *Bitmap) Set(x uint32) {
 		copy(bm[blkGrow:], dst.bm)
 		dst.bm = bm
 		dst.offset -= uint32(blkGrow << 6)
+	} else {
+		// Ensure bm has enough blocks
+		blkIdx := int((x - dst.offset) >> 6)
+		if blkIdx >= len(dst.bm) {
+			bm := make(bitmap.Bitmap, blkIdx+1)
+			copy(bm, dst.bm)
+			dst.bm = bm
+		}
 	}
 
 	dst.bm.Set(x - dst.offset)
