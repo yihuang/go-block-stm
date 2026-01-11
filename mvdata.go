@@ -41,34 +41,34 @@ func NewGMVData[V any](isZero func(V) bool, valueLen func(V) int) *GMVData[V] {
 	}
 }
 
-// getTree returns `nil` if not found
-func (d *GMVData[V]) getTree(key Key) *BTree[secondaryDataItem[V]] {
+// getStore returns `nil` if not found
+func (d *GMVData[V]) getStore(key Key) *OptimizedSecondaryStore[V] {
 	outer, _ := d.Get(dataItem[V]{Key: key})
-	return outer.Tree
+	return outer.Store
 }
 
-// getTreeOrDefault set a new tree atomically if not found.
-func (d *GMVData[V]) getTreeOrDefault(key Key) *BTree[secondaryDataItem[V]] {
+// getStoreOrDefault set a new store atomically if not found.
+func (d *GMVData[V]) getStoreOrDefault(key Key) *OptimizedSecondaryStore[V] {
 	return d.GetOrDefault(dataItem[V]{Key: key}, func(item *dataItem[V]) {
-		if item.Tree == nil {
-			item.Tree = NewBTree(secondaryLesser[V], InnerBTreeDegree)
+		if item.Store == nil {
+			item.Store = NewOptimizedSecondaryStore[V]()
 		}
-	}).Tree
+	}).Store
 }
 
 func (d *GMVData[V]) Write(key Key, value V, version TxnVersion) {
-	tree := d.getTreeOrDefault(key)
-	tree.Set(secondaryDataItem[V]{Index: version.Index, Incarnation: version.Incarnation, Value: value})
+	store := d.getStoreOrDefault(key)
+	store.Write(value, version)
 }
 
 func (d *GMVData[V]) WriteEstimate(key Key, txn TxnIndex) {
-	tree := d.getTreeOrDefault(key)
-	tree.Set(secondaryDataItem[V]{Index: txn, Estimate: true})
+	store := d.getStoreOrDefault(key)
+	store.WriteEstimate(txn)
 }
 
 func (d *GMVData[V]) Delete(key Key, txn TxnIndex) {
-	tree := d.getTreeOrDefault(key)
-	tree.Delete(secondaryDataItem[V]{Index: txn})
+	store := d.getStoreOrDefault(key)
+	store.Delete(txn)
 }
 
 // Read returns the value and the version of the value that's less than the given txn.
@@ -81,18 +81,12 @@ func (d *GMVData[V]) Read(key Key, txn TxnIndex) (V, TxnVersion, bool) {
 		return zero, InvalidTxnVersion, false
 	}
 
-	tree := d.getTree(key)
-	if tree == nil {
+	store := d.getStore(key)
+	if store == nil {
 		return zero, InvalidTxnVersion, false
 	}
 
-	// find the closing txn that's less than the given txn
-	item, ok := seekClosestTxn(tree, txn)
-	if !ok {
-		return zero, InvalidTxnVersion, false
-	}
-
-	return item.Value, item.Version(), item.Estimate
+	return store.Read(txn)
 }
 
 func (d *GMVData[V]) Iterator(
@@ -171,7 +165,7 @@ func (d *GMVData[V]) Snapshot() (snapshot []GKVPair[V]) {
 
 func (d *GMVData[V]) SnapshotTo(cb func(Key, V) bool) {
 	d.Scan(func(outer dataItem[V]) bool {
-		item, ok := outer.Tree.Max()
+		item, ok := outer.Store.Max()
 		if !ok {
 			return true
 		}
@@ -203,8 +197,8 @@ type GKVPair[V any] struct {
 type KVPair = GKVPair[[]byte]
 
 type dataItem[V any] struct {
-	Key  Key
-	Tree *BTree[secondaryDataItem[V]]
+	Key   Key
+	Store *OptimizedSecondaryStore[V]
 }
 
 var _ KeyItem = dataItem[[]byte]{}

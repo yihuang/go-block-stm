@@ -72,7 +72,7 @@ func (it *MVIterator[V]) ReadEstimateValue() bool {
 func (it *MVIterator[V]) resolveValue() {
 	inner := &it.BTreeIteratorG
 	for ; inner.Valid(); inner.Next() {
-		v, ok := it.resolveValueInner(inner.Item().Tree)
+		v, ok := it.resolveValueInner(inner.Item().Store)
 		if !ok {
 			// abort the iterator
 			it.valid = false
@@ -102,22 +102,57 @@ func (it *MVIterator[V]) resolveValue() {
 // - (nil, true) if the value is not found
 // - (nil, false) if the value is an estimate and we should fail the validation
 // - (v, true) if the value is found
-func (it *MVIterator[V]) resolveValueInner(tree *BTree[secondaryDataItem[V]]) (*secondaryDataItem[V], bool) {
+func (it *MVIterator[V]) resolveValueInner(store *OptimizedSecondaryStore[V]) (*secondaryDataItem[V], bool) {
 	for {
-		v, ok := seekClosestTxn(tree, it.txn)
-		if !ok {
+		value, version, estimate := store.Read(it.txn)
+		if !version.Valid() {
+			// value not found
 			return nil, true
 		}
 
-		if v.Estimate {
+		if estimate {
 			if it.Executing() {
-				it.waitFn(v.Index)
+				it.waitFn(version.Index)
 				continue
 			}
-			// in validation mode, it should fail validation immediatelly
+			// in validation mode, it should fail validation immediately
 			return nil, false
 		}
 
-		return &v, true
+		return &secondaryDataItem[V]{
+			Index:       version.Index,
+			Incarnation: version.Incarnation,
+			Value:       value,
+			Estimate:    false,
+		}, true
 	}
+}
+
+// The following methods are required by storetypes.Iterator interface
+func (it *MVIterator[V]) Domain() (start, end []byte) {
+	return it.BTreeIteratorG.Domain()
+}
+
+func (it *MVIterator[V]) Valid() bool {
+	return it.BTreeIteratorG.Valid()
+}
+
+func (it *MVIterator[V]) Key() []byte {
+	return it.BTreeIteratorG.Item().Key
+}
+
+func (it *MVIterator[V]) ValueBytes() []byte {
+	if v, ok := any(it.value).([]byte); ok {
+		return v
+	}
+	return nil
+}
+
+func (it *MVIterator[V]) Close() error {
+	it.BTreeIteratorG.Close()
+	return nil
+}
+
+func (it *MVIterator[V]) Error() error {
+	return nil
 }
