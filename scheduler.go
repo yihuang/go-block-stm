@@ -20,6 +20,19 @@ func makeValidationIdxWave(wave, idx uint64) uint64 {
 	return (wave << 32) | (idx & 0xFFFFFFFF)
 }
 
+// Helper functions for combined commit index and wave
+func commitWave(val uint64) uint64 {
+	return val >> 32
+}
+
+func commitIdx(val uint64) uint64 {
+	return val & 0xFFFFFFFF
+}
+
+func makeCommitIdxWave(wave, idx uint64) uint64 {
+	return (wave << 32) | (idx & 0xFFFFFFFF)
+}
+
 type TaskKind int
 
 const (
@@ -66,30 +79,23 @@ type Scheduler struct {
 	validatedTxns atomic.Int64
 
 	// Rolling commit counters
-	commit_idx      atomic.Uint64           // Next transaction to commit
+	commit_idx_wave atomic.Uint64           // Combined: upper 32 bits = commit_wave, lower 32 bits = commit_idx
 	triggered_wave  []atomic.Uint64         // Wave counter when tx i triggers wave validation
-	commit_wave     []atomic.Uint64         // Max triggered_wave in i and all txs before it
 	required_wave   []atomic.Uint64         // Current wave number when triggering specific tx validation
 }
 
 func NewScheduler(block_size int) *Scheduler {
 	// Initialize atomic arrays for rolling commit
 	triggered_wave := make([]atomic.Uint64, block_size)
-	commit_wave := make([]atomic.Uint64, block_size)
 	required_wave := make([]atomic.Uint64, block_size)
-
-	// Initialize commit_wave[0] to 0
-	if block_size > 0 {
-		commit_wave[0].Store(0)
-	}
 
 	return &Scheduler{
 		block_size:     block_size,
 		txn_dependency: make([]TxDependency, block_size),
 		txn_status:     make([]StatusEntry, block_size),
 		triggered_wave: triggered_wave,
-		commit_wave:    commit_wave,
 		required_wave:  required_wave,
+		// commit_idx_wave is initialized to 0 (commit_idx = 0, commit_wave = 0)
 	}
 }
 
@@ -301,30 +307,39 @@ func (s *Scheduler) Stats() string {
 // 1. All previous transactions are committed (commit_idx == txn)
 // 2. The last validation is successful and late enough (current wave >= commit_wave and required_wave)
 func (s *Scheduler) TryCommit(txn TxnIndex, incarnation Incarnation) bool {
-	// Check condition 1: All previous transactions are committed
-	if s.commit_idx.Load() != uint64(txn) {
-		return false
-	}
+	for {
+		old := s.commit_idx_wave.Load()
+		oldCommitWave := commitWave(old)
+		oldCommitIdx := commitIdx(old)
 
-	// Check condition 2: Validation is successful and late enough
-	currentWave := validationWave(s.validation_idx_wave.Load())
-	commitWave := s.commit_wave[txn].Load()
-	requiredWave := s.required_wave[txn].Load()
+		// Check condition 1: All previous transactions are committed
+		if oldCommitIdx != uint64(txn) {
+			return false
+		}
 
-	if currentWave >= commitWave && currentWave >= requiredWave {
-		// Update commit_wave for next transaction
-		nextCommitWave := commitWave
-		if triggeredWave := s.triggered_wave[txn].Load(); triggeredWave > nextCommitWave {
-			nextCommitWave = triggeredWave
+		// Check condition 2: Validation is successful and late enough
+		currentWave := validationWave(s.validation_idx_wave.Load())
+		requiredWave := s.required_wave[txn].Load()
+
+		if currentWave < oldCommitWave || currentWave < requiredWave {
+			return false
 		}
-		if int(txn)+1 < s.block_size {
-			s.commit_wave[txn+1].Store(nextCommitWave)
+
+		// Compute new commit wave for next transaction
+		newCommitWave := oldCommitWave
+		if triggeredWave := s.triggered_wave[txn].Load(); triggeredWave > newCommitWave {
+			newCommitWave = triggeredWave
 		}
-		// Increment commit_idx
-		s.commit_idx.Add(1)
-		return true
+
+		// Increment commit index, update commit wave
+		newCommitIdx := oldCommitIdx + 1
+		newVal := makeCommitIdxWave(newCommitWave, newCommitIdx)
+
+		if s.commit_idx_wave.CompareAndSwap(old, newVal) {
+			return true
+		}
+		// CAS failed, retry
 	}
-	return false
 }
 
 // IsCommitted returns true if transaction txn is committed.
@@ -337,4 +352,10 @@ func (s *Scheduler) IsCommitted(txn TxnIndex) bool {
 // This is primarily for testing purposes.
 func (s *Scheduler) GetValidationWave() uint64 {
 	return validationWave(s.validation_idx_wave.Load())
+}
+
+// GetCommitIdx returns the current commit index.
+// This is primarily for testing purposes.
+func (s *Scheduler) GetCommitIdx() uint64 {
+	return commitIdx(s.commit_idx_wave.Load())
 }

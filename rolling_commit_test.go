@@ -9,8 +9,8 @@ func TestRollingCommitBasic(t *testing.T) {
 	scheduler := NewScheduler(blockSize)
 
 	// Test initial state
-	if scheduler.commit_idx.Load() != 0 {
-		t.Errorf("Expected commit_idx to be 0, got %d", scheduler.commit_idx.Load())
+	if scheduler.GetCommitIdx() != 0 {
+		t.Errorf("Expected commit_idx to be 0, got %d", scheduler.GetCommitIdx())
 	}
 
 	// Simulate execution of transaction 0
@@ -30,8 +30,8 @@ func TestRollingCommitBasic(t *testing.T) {
 	if !scheduler.IsCommitted(0) {
 		t.Error("Transaction 0 should be committed")
 	}
-	if scheduler.commit_idx.Load() != 1 {
-		t.Errorf("Expected commit_idx to be 1, got %d", scheduler.commit_idx.Load())
+	if scheduler.GetCommitIdx() != 1 {
+		t.Errorf("Expected commit_idx to be 1, got %d", scheduler.GetCommitIdx())
 	}
 }
 
@@ -54,9 +54,9 @@ func TestRollingCommitWaveValidation(t *testing.T) {
 		t.Errorf("Transaction 0 should have triggered_wave = %d, got %d", wave, scheduler.triggered_wave[0].Load())
 	}
 
-	// commit_wave[0] should be initialized to 0
-	if scheduler.commit_wave[0].Load() != 0 {
-		t.Errorf("commit_wave[0] should be 0, got %d", scheduler.commit_wave[0].Load())
+	// commit_idx should be initialized to 0
+	if scheduler.GetCommitIdx() != 0 {
+		t.Errorf("commit_idx should be 0, got %d", scheduler.GetCommitIdx())
 	}
 }
 
@@ -87,8 +87,8 @@ func TestRollingCommitOrder(t *testing.T) {
 	if !scheduler.IsCommitted(0) {
 		t.Error("Transaction 0 should be committed")
 	}
-	if scheduler.commit_idx.Load() != 1 {
-		t.Errorf("Expected commit_idx to be 1, got %d", scheduler.commit_idx.Load())
+	if scheduler.GetCommitIdx() != 1 {
+		t.Errorf("Expected commit_idx to be 1, got %d", scheduler.GetCommitIdx())
 	}
 
 	// Now transaction 1 should be able to commit
