@@ -10,6 +10,7 @@ const (
 	StatusExecuted
 	StatusAborting
 	StatusSuspended
+	StatusCommitted
 )
 
 // StatusEntry is a state machine for the status of a transaction, all the transitions are atomic protected by a mutex.
@@ -22,6 +23,7 @@ const (
 //	Executing --> Executed: SetExecuted()
 //	Executing --> Suspended: Suspend(cond)\nset cond
 //	Executed --> Aborting: TryValidationAbort(incarnation)
+//	Executed --> Committed: SetCommitted()
 //	Aborting --> ReadyToExecute: SetReadyStatus()\nincarnation++
 //	Suspended --> Executing: Resume()
 //
@@ -115,4 +117,21 @@ func (s *StatusEntry) Suspend(cond *Condvar) {
 	s.status = StatusSuspended
 
 	s.Unlock()
+}
+
+// SetCommitted marks the transaction as committed.
+// Status must be EXECUTED.
+func (s *StatusEntry) SetCommitted() {
+	s.Lock()
+	// status must be EXECUTED
+	s.status = StatusCommitted
+	s.Unlock()
+}
+
+// IsCommitted returns true if the transaction is committed.
+func (s *StatusEntry) IsCommitted() bool {
+	s.Lock()
+	committed := s.status == StatusCommitted
+	s.Unlock()
+	return committed
 }

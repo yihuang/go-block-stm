@@ -51,13 +51,33 @@ type Scheduler struct {
 	// metrics
 	executedTxns  atomic.Int64
 	validatedTxns atomic.Int64
+
+	// Rolling commit counters
+	validation_wave atomic.Uint64           // Increased when validation wave is triggered
+	commit_idx      atomic.Uint64           // Next transaction to commit
+	triggered_wave  []atomic.Uint64         // Wave counter when tx i triggers wave validation
+	commit_wave     []atomic.Uint64         // Max triggered_wave in i and all txs before it
+	required_wave   []atomic.Uint64         // Current wave number when triggering specific tx validation
 }
 
 func NewScheduler(block_size int) *Scheduler {
+	// Initialize atomic arrays for rolling commit
+	triggered_wave := make([]atomic.Uint64, block_size)
+	commit_wave := make([]atomic.Uint64, block_size)
+	required_wave := make([]atomic.Uint64, block_size)
+
+	// Initialize commit_wave[0] to 0
+	if block_size > 0 {
+		commit_wave[0].Store(0)
+	}
+
 	return &Scheduler{
 		block_size:     block_size,
 		txn_dependency: make([]TxDependency, block_size),
 		txn_status:     make([]StatusEntry, block_size),
+		triggered_wave: triggered_wave,
+		commit_wave:    commit_wave,
+		required_wave:  required_wave,
 	}
 }
 
@@ -68,6 +88,13 @@ func (s *Scheduler) Done() bool {
 func (s *Scheduler) DecreaseValidationIdx(target TxnIndex) {
 	StoreMin(&s.validation_idx, uint64(target))
 	s.decrease_cnt.Add(1)
+
+	// Record wave validation trigger
+	wave := s.validation_wave.Add(1)
+	limit := min(int(target)+1, s.block_size)
+	for i := 0; i < limit; i++ {
+		s.triggered_wave[i].Store(wave)
+	}
 }
 
 func (s *Scheduler) CheckDone() {
@@ -124,7 +151,10 @@ func (s *Scheduler) NextVersionToValidate() TxnVersion {
 	idx_to_validate := FetchIncr(&s.validation_idx)
 	if idx_to_validate < uint64(s.block_size) {
 		if ok, incarnation := s.txn_status[idx_to_validate].IsExecuted(); ok {
-			return TxnVersion{TxnIndex(idx_to_validate), incarnation}
+			// Check if transaction is already committed
+			if !s.txn_status[idx_to_validate].IsCommitted() {
+				return TxnVersion{TxnIndex(idx_to_validate), incarnation}
+			}
 		}
 	}
 
@@ -180,6 +210,8 @@ func (s *Scheduler) FinishExecution(version TxnVersion, wroteNewPath bool) (TxnV
 	if s.validation_idx.Load() > uint64(version.Index) { // otherwise index already small enough
 		if !wroteNewPath {
 			// schedule validation for current tx only, don't decrease num_active_tasks
+			// Record the current wave number for this specific validation
+			s.required_wave[version.Index].Store(s.validation_wave.Load())
 			return version, TaskKindValidation
 		}
 		// schedule validation for txn_idx and higher txns
@@ -201,6 +233,14 @@ func (s *Scheduler) FinishValidation(txn TxnIndex, aborted bool) (TxnVersion, Ta
 		if s.execution_idx.Load() > uint64(txn) {
 			return s.TryIncarnate(txn), TaskKindExecution
 		}
+	} else {
+		// Validation succeeded, try to commit
+		if ok, incarnation := s.txn_status[txn].IsExecuted(); ok {
+			if s.TryCommit(txn, incarnation) {
+				// Transaction committed - mark as committed status
+				s.txn_status[txn].SetCommitted()
+			}
+		}
 	}
 
 	DecrAtomic(&s.num_active_tasks)
@@ -210,4 +250,41 @@ func (s *Scheduler) FinishValidation(txn TxnIndex, aborted bool) (TxnVersion, Ta
 func (s *Scheduler) Stats() string {
 	return fmt.Sprintf("executed: %d, validated: %d",
 		s.executedTxns.Load(), s.validatedTxns.Load())
+}
+
+// TryCommit attempts to commit transaction txn with given incarnation.
+// A transaction is committed iff:
+// 1. All previous transactions are committed (commit_idx == txn)
+// 2. The last validation is successful and late enough (current wave >= commit_wave and required_wave)
+func (s *Scheduler) TryCommit(txn TxnIndex, incarnation Incarnation) bool {
+	// Check condition 1: All previous transactions are committed
+	if s.commit_idx.Load() != uint64(txn) {
+		return false
+	}
+
+	// Check condition 2: Validation is successful and late enough
+	currentWave := s.validation_wave.Load()
+	commitWave := s.commit_wave[txn].Load()
+	requiredWave := s.required_wave[txn].Load()
+
+	if currentWave >= commitWave && currentWave >= requiredWave {
+		// Update commit_wave for next transaction
+		nextCommitWave := commitWave
+		if triggeredWave := s.triggered_wave[txn].Load(); triggeredWave > nextCommitWave {
+			nextCommitWave = triggeredWave
+		}
+		if int(txn)+1 < s.block_size {
+			s.commit_wave[txn+1].Store(nextCommitWave)
+		}
+		// Increment commit_idx
+		s.commit_idx.Add(1)
+		return true
+	}
+	return false
+}
+
+// IsCommitted returns true if transaction txn is committed.
+// This is primarily for testing purposes.
+func (s *Scheduler) IsCommitted(txn TxnIndex) bool {
+	return s.txn_status[txn].IsCommitted()
 }
