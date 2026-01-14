@@ -7,6 +7,19 @@ import (
 	"sync/atomic"
 )
 
+// Helper functions for combined validation index and wave
+func validationWave(val uint64) uint64 {
+	return val >> 32
+}
+
+func validationIdx(val uint64) uint64 {
+	return val & 0xFFFFFFFF
+}
+
+func makeValidationIdxWave(wave, idx uint64) uint64 {
+	return (wave << 32) | (idx & 0xFFFFFFFF)
+}
+
 type TaskKind int
 
 const (
@@ -34,8 +47,8 @@ type Scheduler struct {
 
 	// An index that tracks the next transaction to try and execute.
 	execution_idx atomic.Uint64
-	// A similar index for tracking validation.
-	validation_idx atomic.Uint64
+	// Combined validation index and wave (upper 32 bits: wave, lower 32 bits: index)
+	validation_idx_wave atomic.Uint64
 	// Number of times validation_idx or execution_idx was decreased
 	decrease_cnt atomic.Uint64
 	// Number of ongoing validation and execution tasks
@@ -53,7 +66,6 @@ type Scheduler struct {
 	validatedTxns atomic.Int64
 
 	// Rolling commit counters
-	validation_wave atomic.Uint64           // Increased when validation wave is triggered
 	commit_idx      atomic.Uint64           // Next transaction to commit
 	triggered_wave  []atomic.Uint64         // Wave counter when tx i triggers wave validation
 	commit_wave     []atomic.Uint64         // Max triggered_wave in i and all txs before it
@@ -86,21 +98,37 @@ func (s *Scheduler) Done() bool {
 }
 
 func (s *Scheduler) DecreaseValidationIdx(target TxnIndex) {
-	StoreMin(&s.validation_idx, uint64(target))
-	s.decrease_cnt.Add(1)
+	for {
+		old := s.validation_idx_wave.Load()
+		oldWave := validationWave(old)
+		oldIdx := validationIdx(old)
 
-	// Record wave validation trigger
-	wave := s.validation_wave.Add(1)
-	limit := min(int(target)+1, s.block_size)
-	for i := 0; i < limit; i++ {
-		s.triggered_wave[i].Store(wave)
+		// Only update if new index is smaller than current index
+		if uint64(target) >= oldIdx {
+			return
+		}
+
+		// Increment wave, set new index
+		newWave := oldWave + 1
+		newVal := makeValidationIdxWave(newWave, uint64(target))
+
+		if s.validation_idx_wave.CompareAndSwap(old, newVal) {
+			s.decrease_cnt.Add(1)
+
+			// Record wave validation trigger
+			limit := min(int(target)+1, s.block_size)
+			for i := 0; i < limit; i++ {
+				s.triggered_wave[i].Store(newWave)
+			}
+			return
+		}
 	}
 }
 
 func (s *Scheduler) CheckDone() {
 	observed_cnt := s.decrease_cnt.Load()
 	if s.execution_idx.Load() >= uint64(s.block_size) &&
-		s.validation_idx.Load() >= uint64(s.block_size) &&
+		validationIdx(s.validation_idx_wave.Load()) >= uint64(s.block_size) &&
 		s.num_active_tasks.Load() == 0 {
 		if observed_cnt == s.decrease_cnt.Load() {
 			s.done_marker.Store(true)
@@ -143,23 +171,39 @@ func (s *Scheduler) NextVersionToExecute() TxnVersion {
 //
 // Invariant `num_active_tasks`: increased if a valid task is returned.
 func (s *Scheduler) NextVersionToValidate() TxnVersion {
-	if s.validation_idx.Load() >= uint64(s.block_size) {
+	if validationIdx(s.validation_idx_wave.Load()) >= uint64(s.block_size) {
 		s.CheckDone()
 		return InvalidTxnVersion
 	}
 	IncrAtomic(&s.num_active_tasks)
-	idx_to_validate := FetchIncr(&s.validation_idx)
-	if idx_to_validate < uint64(s.block_size) {
-		if ok, incarnation := s.txn_status[idx_to_validate].IsExecuted(); ok {
-			// Check if transaction is already committed
-			if !s.txn_status[idx_to_validate].IsCommitted() {
-				return TxnVersion{TxnIndex(idx_to_validate), incarnation}
+
+	// Atomically increment just the index part while keeping wave part unchanged
+	for {
+		old := s.validation_idx_wave.Load()
+		oldWave := validationWave(old)
+		oldIdx := validationIdx(old)
+
+		if oldIdx >= uint64(s.block_size) {
+			DecrAtomic(&s.num_active_tasks)
+			return InvalidTxnVersion
+		}
+
+		newIdx := oldIdx + 1
+		newVal := makeValidationIdxWave(oldWave, newIdx)
+
+		if s.validation_idx_wave.CompareAndSwap(old, newVal) {
+			if oldIdx < uint64(s.block_size) {
+				if ok, incarnation := s.txn_status[oldIdx].IsExecuted(); ok {
+					// Check if transaction is already committed
+					if !s.txn_status[oldIdx].IsCommitted() {
+						return TxnVersion{TxnIndex(oldIdx), incarnation}
+					}
+				}
 			}
+			DecrAtomic(&s.num_active_tasks)
+			return InvalidTxnVersion
 		}
 	}
-
-	DecrAtomic(&s.num_active_tasks)
-	return InvalidTxnVersion
 }
 
 // NextTask returns the transaction index and task kind for the next task to execute or validate,
@@ -167,7 +211,7 @@ func (s *Scheduler) NextVersionToValidate() TxnVersion {
 //
 // Invariant `num_active_tasks`: increased if a valid task is returned.
 func (s *Scheduler) NextTask() (TxnVersion, TaskKind) {
-	validation_idx := s.validation_idx.Load()
+	validation_idx := validationIdx(s.validation_idx_wave.Load())
 	execution_idx := s.execution_idx.Load()
 	if validation_idx < execution_idx {
 		return s.NextVersionToValidate(), TaskKindValidation
@@ -207,11 +251,11 @@ func (s *Scheduler) FinishExecution(version TxnVersion, wroteNewPath bool) (TxnV
 
 	deps := s.txn_dependency[version.Index].Swap(nil)
 	s.ResumeDependencies(deps)
-	if s.validation_idx.Load() > uint64(version.Index) { // otherwise index already small enough
+	if validationIdx(s.validation_idx_wave.Load()) > uint64(version.Index) { // otherwise index already small enough
 		if !wroteNewPath {
 			// schedule validation for current tx only, don't decrease num_active_tasks
 			// Record the current wave number for this specific validation
-			s.required_wave[version.Index].Store(s.validation_wave.Load())
+			s.required_wave[version.Index].Store(validationWave(s.validation_idx_wave.Load()))
 			return version, TaskKindValidation
 		}
 		// schedule validation for txn_idx and higher txns
@@ -263,7 +307,7 @@ func (s *Scheduler) TryCommit(txn TxnIndex, incarnation Incarnation) bool {
 	}
 
 	// Check condition 2: Validation is successful and late enough
-	currentWave := s.validation_wave.Load()
+	currentWave := validationWave(s.validation_idx_wave.Load())
 	commitWave := s.commit_wave[txn].Load()
 	requiredWave := s.required_wave[txn].Load()
 
@@ -287,4 +331,10 @@ func (s *Scheduler) TryCommit(txn TxnIndex, incarnation Incarnation) bool {
 // This is primarily for testing purposes.
 func (s *Scheduler) IsCommitted(txn TxnIndex) bool {
 	return s.txn_status[txn].IsCommitted()
+}
+
+// GetValidationWave returns the current validation wave.
+// This is primarily for testing purposes.
+func (s *Scheduler) GetValidationWave() uint64 {
+	return validationWave(s.validation_idx_wave.Load())
 }
