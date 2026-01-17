@@ -17,7 +17,7 @@ func TestRollingCommitBasic(t *testing.T) {
 	scheduler.txn_status[0].SetExecuted()
 
 	// Schedule validation for transaction 0 only (specific validation)
-	scheduler.required_wave[0].Store(scheduler.GetValidationWave())
+	scheduler.txn_status[0].SetRequiredWave(scheduler.GetValidationWave())
 
 	// Simulate successful validation of transaction 0
 	if ok, incarnation := scheduler.txn_status[0].IsExecuted(); ok {
@@ -50,8 +50,8 @@ func TestRollingCommitWaveValidation(t *testing.T) {
 	// Check that triggered_wave is set for transactions 0 (and maybe 1, 2 depending on implementation)
 	wave := scheduler.GetValidationWave()
 	// According to our implementation, DecreaseValidationIdx sets triggered_wave for i <= target
-	if scheduler.triggered_wave[0].Load() != wave {
-		t.Errorf("Transaction 0 should have triggered_wave = %d, got %d", wave, scheduler.triggered_wave[0].Load())
+	if scheduler.txn_status[0].GetTriggeredWave() != wave {
+		t.Errorf("Transaction 0 should have triggered_wave = %d, got %d", wave, scheduler.txn_status[0].GetTriggeredWave())
 	}
 
 	// commit_idx should be initialized to 0
@@ -77,7 +77,7 @@ func TestRollingCommitOrder(t *testing.T) {
 	}
 
 	// Commit transaction 0
-	scheduler.required_wave[0].Store(scheduler.GetValidationWave())
+	scheduler.txn_status[0].SetRequiredWave(scheduler.GetValidationWave())
 	if ok, incarnation := scheduler.txn_status[0].IsExecuted(); ok {
 		if scheduler.TryCommit(0, incarnation) {
 			scheduler.txn_status[0].SetCommitted()
@@ -92,7 +92,7 @@ func TestRollingCommitOrder(t *testing.T) {
 	}
 
 	// Now transaction 1 should be able to commit
-	scheduler.required_wave[1].Store(scheduler.GetValidationWave())
+	scheduler.txn_status[1].SetRequiredWave(scheduler.GetValidationWave())
 	if ok, incarnation := scheduler.txn_status[1].IsExecuted(); ok {
 		if scheduler.TryCommit(1, incarnation) {
 			scheduler.txn_status[1].SetCommitted()
@@ -110,7 +110,7 @@ func TestRollingCommitSkipCommitted(t *testing.T) {
 
 	// Execute and commit transaction 0
 	scheduler.txn_status[0].SetExecuted()
-	scheduler.required_wave[0].Store(scheduler.GetValidationWave())
+	scheduler.txn_status[0].SetRequiredWave(scheduler.GetValidationWave())
 	if ok, incarnation := scheduler.txn_status[0].IsExecuted(); ok {
 		if scheduler.TryCommit(0, incarnation) {
 			scheduler.txn_status[0].SetCommitted()

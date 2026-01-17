@@ -80,21 +80,13 @@ type Scheduler struct {
 
 	// Rolling commit counters
 	commit_idx_wave atomic.Uint64           // Combined: upper 32 bits = commit_wave, lower 32 bits = commit_idx
-	triggered_wave  []atomic.Uint64         // Wave counter when tx i triggers wave validation
-	required_wave   []atomic.Uint64         // Current wave number when triggering specific tx validation
 }
 
 func NewScheduler(block_size int) *Scheduler {
-	// Initialize atomic arrays for rolling commit
-	triggered_wave := make([]atomic.Uint64, block_size)
-	required_wave := make([]atomic.Uint64, block_size)
-
 	return &Scheduler{
 		block_size:     block_size,
 		txn_dependency: make([]TxDependency, block_size),
 		txn_status:     make([]StatusEntry, block_size),
-		triggered_wave: triggered_wave,
-		required_wave:  required_wave,
 		// commit_idx_wave is initialized to 0 (commit_idx = 0, commit_wave = 0)
 	}
 }
@@ -124,7 +116,7 @@ func (s *Scheduler) DecreaseValidationIdx(target TxnIndex) {
 			// Record wave validation trigger
 			limit := min(int(target)+1, s.block_size)
 			for i := 0; i < limit; i++ {
-				s.triggered_wave[i].Store(newWave)
+				s.txn_status[i].SetTriggeredWave(newWave)
 			}
 			return
 		}
@@ -261,7 +253,7 @@ func (s *Scheduler) FinishExecution(version TxnVersion, wroteNewPath bool) (TxnV
 		if !wroteNewPath {
 			// schedule validation for current tx only, don't decrease num_active_tasks
 			// Record the current wave number for this specific validation
-			s.required_wave[version.Index].Store(validationWave(s.validation_idx_wave.Load()))
+			s.txn_status[version.Index].SetRequiredWave(validationWave(s.validation_idx_wave.Load()))
 			return version, TaskKindValidation
 		}
 		// schedule validation for txn_idx and higher txns
@@ -319,7 +311,7 @@ func (s *Scheduler) TryCommit(txn TxnIndex, incarnation Incarnation) bool {
 
 		// Check condition 2: Validation is successful and late enough
 		currentWave := validationWave(s.validation_idx_wave.Load())
-		requiredWave := s.required_wave[txn].Load()
+		requiredWave := s.txn_status[txn].GetRequiredWave()
 
 		if currentWave < oldCommitWave || currentWave < requiredWave {
 			return false
@@ -327,7 +319,7 @@ func (s *Scheduler) TryCommit(txn TxnIndex, incarnation Incarnation) bool {
 
 		// Compute new commit wave for next transaction
 		newCommitWave := oldCommitWave
-		if triggeredWave := s.triggered_wave[txn].Load(); triggeredWave > newCommitWave {
+		if triggeredWave := s.txn_status[txn].GetTriggeredWave(); triggeredWave > newCommitWave {
 			newCommitWave = triggeredWave
 		}
 
